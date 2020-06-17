@@ -1329,6 +1329,8 @@ void ElfFile<ElfFileParamNames>::removeNeeded(const std::set<std::string> & libs
     auto shdrDynStr = findSection(".dynstr");
     char * strTab = (char *) contents + rdi(shdrDynStr.sh_offset);
 
+    unsigned int verNeedNum = 0;
+
     Elf_Dyn * dyn = (Elf_Dyn *) (contents + rdi(shdrDynamic.sh_offset));
     Elf_Dyn * last = dyn;
     for ( ; rdi(dyn->d_tag) != DT_NULL; dyn++) {
@@ -1343,9 +1345,62 @@ void ElfFile<ElfFileParamNames>::removeNeeded(const std::set<std::string> & libs
             }
         } else
             *last++ = *dyn;
+
+        if (rdi(dyn->d_tag) == DT_VERNEEDNUM) {
+            verNeedNum = rdi(dyn->d_un.d_val);
+        }
     }
 
     memset(last, 0, sizeof(Elf_Dyn) * (dyn - last));
+
+    // If a removed library uses symbol versions, then there will also be
+    // references to it in the "version needed" table, and these also need to
+    // be removed.
+    if (verNeedNum) {
+        auto shdrVersionR = findSection(".gnu.version_r");
+        // The filename strings in the .gnu.version_r are different from the
+        // ones in .dynamic: instead of being in .dynstr, they're in some
+        // arbitrary section and we have to look in ->sh_link to figure out
+        // which one.
+        Elf_Shdr & shdrVersionRStrings = shdrs[rdi(shdrVersionR.sh_link)];
+        // this is where we find the actual filename strings
+        char * verStrTab = (char *) contents + rdi(shdrVersionRStrings.sh_offset);
+        // and we also need the name of the section containing the strings, so
+        // that we can pass it to replaceSection
+        std::string versionRStringsSName = getSectionName(shdrVersionRStrings);
+
+        debug("found .gnu.version_r with %i entries, strings in %s\n", verNeedNum, versionRStringsSName.c_str());
+
+        unsigned int verStrAddedBytes = 0;
+
+        Elf_Verneed * need = (Elf_Verneed *) (contents + rdi(shdrVersionR.sh_offset));
+        while (verNeedNum > 0) {
+            char * file = verStrTab + rdi(need->vn_file);
+            auto i = libs.find(file);
+            if (i != libs.end()) {
+                // remove
+                auto replacement = i->second;
+
+                debug("removing .gnu.version_r entry '%s' with '%s'\n", file, replacement.c_str());
+                debug("resizing string section %s ...\n", versionRStringsSName.c_str());
+
+                // std::string & newVerDynStr = replaceSection(versionRStringsSName,
+                //     rdi(shdrVersionRStrings.sh_size) + replacement.size() + 1 + verStrAddedBytes);
+                // setSubstr(newVerDynStr, rdi(shdrVersionRStrings.sh_size) + verStrAddedBytes, replacement + '\0');
+
+                // wri(need->vn_file, rdi(shdrVersionRStrings.sh_size) + verStrAddedBytes);
+
+                // verStrAddedBytes += replacement.size() + 1;
+
+                changed = true;
+            } else {
+                debug("keeping .gnu.version_r entry '%s'\n", file);
+            }
+            // the Elf_Verneed structures form a linked list, so jump to next entry
+            need = (Elf_Verneed *) (((char *) need) + rdi(need->vn_next));
+            --verNeedNum;
+        }
+    }
 }
 
 template<ElfFileParams>
